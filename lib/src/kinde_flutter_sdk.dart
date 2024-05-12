@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:html' as html;
 import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_appauth/flutter_appauth.dart';
 import 'package:flutter_custom_tabs/flutter_custom_tabs.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -23,6 +25,8 @@ import 'package:kinde_flutter_sdk/src/token/token_api.dart';
 import 'package:kinde_flutter_sdk/src/token/token_utils.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pubspec_parse/pubspec_parse.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:oauth2/oauth2.dart' as oauth2;
 
 class KindeFlutterSDK with TokenUtils, HandleNetworkMixin {
   static const _orgCodeParamName = 'org_code';
@@ -140,13 +144,20 @@ class KindeFlutterSDK with TokenUtils, HandleNetworkMixin {
 
     final secureKey = await getSecureKey(secureStorage);
 
-    final path = await getTemporaryDirectory();
-
-    await Store.init(HiveAesCipher(secureKey), path.path);
+    if (kIsWeb) {
+      final path = html.window.localStorage['temporary_directory'] ?? '';
+      await Store.init(HiveAesCipher(secureKey), path);
+    } else {
+      final path = await getTemporaryDirectory();
+      await Store.init(HiveAesCipher(secureKey), path.path);
+    }
   }
 
-  Future<void> logout() async {
-    if (Platform.isIOS) {
+  Future<void> logout({Dio? dio}) async {
+    if (kIsWeb) {
+      html.window.location.assign(_buildEndSessionUrl().toString());
+      _store.clear();
+    } else if (Platform.isIOS) {
       final browser = ChromeSafariBrowser();
       await browser.open(url: _buildEndSessionUrl()).then((value) async {
         await browser.close();
@@ -158,12 +169,14 @@ class KindeFlutterSDK with TokenUtils, HandleNetworkMixin {
     await Store.instance.clear();
   }
 
-  Future<String?> login({AuthFlowType? type, String? orgCode}) async {
-    return _redirectToKinde(type: type, orgCode: orgCode);
+  Future<String?> login(
+      {AuthFlowType? type, String? orgCode, BuildContext? context}) async {
+    return _redirectToKinde(type: type, orgCode: orgCode, context: context);
   }
 
   Future<String?> _redirectToKinde(
       {AuthFlowType? type,
+      BuildContext? context,
       String? orgCode,
       Map<String, String> additionalParams = const {}}) async {
     final params = HashMap<String, String>.from(additionalParams);
@@ -174,7 +187,9 @@ class KindeFlutterSDK with TokenUtils, HandleNetworkMixin {
       params.putIfAbsent(_audienceParamName, () => _config!.audience!);
     }
 
-    if (type == AuthFlowType.pkce) {
+    if (kIsWeb) {
+      return _webLogin(params);
+    } else if (type == AuthFlowType.pkce) {
       return _pkceLogin(params);
     } else {
       return _normalLogin(params);
@@ -235,8 +250,82 @@ class KindeFlutterSDK with TokenUtils, HandleNetworkMixin {
     }
   }
 
-  Future<bool> isAuthenticate() async =>
-      authState != null && !authState!.isExpired() && await _checkToken();
+  Future<bool> isAuthenticate() async {
+    if (kIsWeb && (authState == null || authState!.isExpired())) {
+      final url = Uri.parse(html.window.location.href);
+      if (url.queryParameters.containsKey("code")) {
+        _webLogin({});
+      }
+    }
+    return authState != null && !authState!.isExpired() && await _checkToken();
+  }
+
+  Future<String?> _webLogin(Map<String, String> additionalParams) async {
+    final credentials = _store.authState;
+
+    if (credentials != null && !credentials.isExpired()) {
+      return credentials.accessToken;
+    }
+
+    var grant = oauth2.AuthorizationCodeGrant(
+      _config!.authClientId,
+      Uri.parse(
+        _serviceConfiguration.authorizationEndpoint,
+      ),
+      Uri.parse(
+        _serviceConfiguration.tokenEndpoint,
+      ),
+      codeVerifier: "auPYZiQfHz0PSgj5cWMpZK1ur4kVvs741NIWHLxw3OI",
+      getParameters: (contentType, body) {
+        return additionalParams;
+      },
+      onCredentialsRefreshed: (p0) {
+        AuthorizationTokenResponse token = AuthorizationTokenResponse(
+            p0.accessToken,
+            p0.refreshToken,
+            p0.expiration,
+            p0.idToken,
+            null,
+            _config!.scopes,
+            null,
+            null);
+        _saveState(token);
+      },
+    );
+
+    var authorizationUrl = grant.getAuthorizationUrl(
+      Uri.parse(_config!.loginRedirectUri),
+      scopes: _config!.scopes,
+      state: 'flutter_kinde_state',
+    );
+
+    Uri url = Uri.parse(html.window.location.href);
+
+    if (url.queryParameters.containsKey("code")) {
+      var response =
+          await grant.handleAuthorizationResponse(url.queryParameters);
+
+      AuthorizationTokenResponse token = AuthorizationTokenResponse(
+          response.credentials.accessToken,
+          response.credentials.refreshToken,
+          response.credentials.expiration,
+          response.credentials.idToken,
+          null,
+          _config!.scopes,
+          null,
+          null);
+
+      html.window.history.pushState({}, '', html.window.location.pathname);
+
+      _saveState(token);
+
+      return token.accessToken;
+    }
+
+    html.window.location.assign(authorizationUrl.toString());
+
+    return null;
+  }
 
   Future<String?> _normalLogin(Map<String, String> additionalParams) async {
     const appAuth = FlutterAppAuth();

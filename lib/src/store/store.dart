@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:hive/hive.dart';
 import 'package:kinde_flutter_sdk/src/keys/keys.dart';
 import 'package:kinde_flutter_sdk/src/token/auth_state.dart';
+import 'package:oauth2/oauth2.dart' as oauth2;
 
 class Store {
   static const String _authState = 'auth_state';
